@@ -1,0 +1,5 @@
+# docker/Dockerfile.mlflow
+FROM ghcr.io/mlflow/mlflow:v2.16.0
+
+# Postgres 접속용 드라이버 미리 설치
+RUN pip install --no-cache-dir psycopg2-binary
