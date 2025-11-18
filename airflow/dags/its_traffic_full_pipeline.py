@@ -113,7 +113,7 @@ default_args = {
 with DAG(
     dag_id="its_traffic_full_pipeline",
     description="E2E pipeline: Kafka ingestion → MinIO lake → Spark curation → Postgres + ML",
-    schedule_interval="@daily",
+    schedule="@daily",
     start_date=datetime(2025, 11, 15),
     catchup=False,
     default_args=default_args,
