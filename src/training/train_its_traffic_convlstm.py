@@ -242,7 +242,7 @@ class TrainConfig:
 
     # Postgres
     pg_host: str = "localhost"
-    pg_port: int = 5431
+    pg_port: int = 5432
     pg_db: str = "mlops"
     pg_user: str = "postgres"
     pg_password: str = "postgres"
@@ -381,21 +381,9 @@ def load_gold_from_postgres(cfg: TrainConfig) -> pd.DataFrame:
     return df
 
 
-# ----------------------------
-# Main
-# ----------------------------
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--job-name", default="its_traffic_5min_convlstm")
-    parser.add_argument("--start-date", required=True, help="YYYYMMDD")
-    parser.add_argument("--end-date", required=True, help="YYYYMMDD")
-    args = parser.parse_args()
-
-    cfg = TrainConfig(
-        job_name=args.job_name,
-        start_date=args.start_date,
-        end_date=args.end_date,
-    )
+def run_training(cfg: TrainConfig) -> None:
+    if not cfg.start_date or not cfg.end_date:
+        raise ValueError("start_date/end_date must be provided for training")
 
     # 기본 출력 폴더들
     os.makedirs(cfg.output_dir, exist_ok=True)
@@ -409,7 +397,8 @@ def main():
     mlflow.set_tracking_uri(tracking_uri)
     mlflow.set_experiment(cfg.mlflow_experiment)
 
-    with mlflow.start_run(run_name=cfg.job_name):
+    run_name = cfg.mlflow_run_name or cfg.job_name
+    with mlflow.start_run(run_name=run_name):
         # --- Config 파라미터 로깅
         mlflow.log_params({
             "job_name": cfg.job_name,
@@ -589,6 +578,21 @@ def main():
 
         if best_state is None:
             print("Warning: best_state is None. No best model saved.")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--job-name", default="its_traffic_5min_convlstm")
+    parser.add_argument("--start-date", required=True, help="YYYYMMDD")
+    parser.add_argument("--end-date", required=True, help="YYYYMMDD")
+    args = parser.parse_args()
+
+    cfg = TrainConfig(
+        job_name=args.job_name,
+        start_date=args.start_date,
+        end_date=args.end_date,
+    )
+    run_training(cfg)
 
 
 if __name__ == "__main__":

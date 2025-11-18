@@ -1,49 +1,34 @@
 # src/common/its_traffic_5min.py
 from __future__ import annotations
 
-from datetime import datetime, timedelta
-from typing import List, Dict, Set
-
 import numpy as np
 import pandas as pd
 import geopandas as gpd
-
+from typing import List, Dict, Set
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
+from datetime import datetime, timedelta
 
-
-# ==============================
-# 상수 (네가 쓰던 값들 그대로 옮김)
-# ==============================
 LINKIDS_ALL: List[str] = [
     "1920161400", "1920161500",
     "1920121301", "1920121401",
     "1920161902", "1920162205", "1920162400",
     "1920000702", "1920000801", "1920121000", "1920121302", "1920121402",
     "1920235801", "1920189001", "1920139400", "1920161801", "1920162207",
-    "1920162304", "1920162500", "1920171200", "1920171600", "1920188900", "1920138500",
+    "1920162304", "1920162500", "1920171200", "1920171600", "1920188900", "1920138500"
 ]
 
 TARGET_LINKS: List[str] = ["1920161400", "1920161500"]
 
-# lake / minio 경로 (원하면 .env / spark_jobs.yml 로 빼도 됨)
 RAW_BASE = "s3a://its/traffic_5min/raw"
 BRONZE_BASE = "s3a://its/traffic_5min/bronze"
 SILVER_BASE = "s3a://its/traffic_5min/silver"
 GOLD_BASE = "s3a://its/traffic_5min/gold"
 
-# 링크 쉐이프파일 경로 (네가 쓰던 경로 그대로)
-LINK_SHP_PATH = "/home/atech/nabis_sim_api/RCNN/NODE_LINK/2021/MOCT_LINK.shp"
+LINK_SHP_PATH = "/data/NODE_LINK/MOCT_LINK.shp"
 
-
-# ==============================
-# 공통: 날짜 리스트 유틸
-# ==============================
 def iter_dates(start: str, end: str):
-    """
-    'YYYYMMDD' 문자열 기준으로 날짜 range 생성.
-    """
     s = datetime.strptime(start, "%Y%m%d")
     e = datetime.strptime(end, "%Y%m%d")
     cur = s
@@ -51,21 +36,7 @@ def iter_dates(start: str, end: str):
         yield cur.strftime("%Y%m%d")
         cur += timedelta(days=1)
 
-
-# ==============================
-# RAW → BRONZE
-# ==============================
 def transform_raw_to_bronze(df: DataFrame) -> DataFrame:
-    """
-    MinIO 에 올라온 ITS raw (CSV) 기준:
-    컬럼 예시: CREATDE, CREATHM, LINKID, ROADINSTTCD, PASNGSPED, PASNGTIME, date
-
-    - 문자열/숫자 dtype 정리
-    - 잘못된 날짜/시각 패턴 제거
-    - PASNGSPED 숫자 변환
-    - DATETIME(timestamp), date 컬럼 정리
-    """
-    # 컬럼 존재 체크 후 없으면 만들어둠
     for c in ["CREATDE", "CREATHM", "LINKID", "PASNGSPED"]:
         if c not in df.columns:
             df = df.withColumn(c, F.lit(None))
@@ -77,38 +48,33 @@ def transform_raw_to_bronze(df: DataFrame) -> DataFrame:
         .withColumn("LINKID", F.col("LINKID").cast(T.StringType()))
     )
 
-    # 유효 날짜/시각만 남기기
     mask_date = F.col("CREATDE").rlike(r"^[0-9]{8}$")
     mask_time = F.col("CREATHM").rlike(r"^[0-9]{4}$")
     df = df.where(mask_date & mask_time)
 
-    # 속도 숫자화 (이상치/헤더 → null)
     df = df.withColumn(
         "PASNGSPED",
         F.when(
             F.col("PASNGSPED").cast(T.StringType()).rlike(r"^[0-9]+(\.[0-9]+)?$"),
-            F.col("PASNGSPED").cast(T.DoubleType())
+            F.col("PASNGSPED").cast(T.DoulbeType())
         ).otherwise(F.lit(None).cast(T.DoubleType()))
     )
 
-    # DATETIME 생성
     df = df.withColumn(
         "DATETIME",
         F.to_timestamp(
-            F.concat_ws("", F.col("CREATDE"), F.col("CREATHM")),
+            F.concat_ws("", F.col("CREATDE", "CREATHM")),
             "yyyyMMddHHmm"
         )
     )
 
     df = df.where(F.col("DATETIME").isNotNull() & F.col("LINKID").isNotNull())
 
-    # date 컬럼 정규화 (없으면 CREATDE 사용)
     if "date" in df.columns:
         df = df.withColumn("date", F.col("date").cast(T.StringType()))
     else:
         df = df.withColumn("date", F.col("CREATDE"))
 
-    # 기본 컬럼 정리
     keep_cols = [
         "date",
         "CREATDE",
@@ -117,31 +83,22 @@ def transform_raw_to_bronze(df: DataFrame) -> DataFrame:
         "ROADINSTTCD",
         "PASNGSPED",
         "PASNGTIME",
-        "DATETIME",
+        "DATETIME"
     ]
     keep_cols = [c for c in keep_cols if c in df.columns]
     return df.select(*keep_cols)
 
-
-# ==============================
-# BRONZE → SILVER
-# ==============================
 def transform_bronze_to_silver(df: DataFrame) -> DataFrame:
-    """
-    bronze (정제된 raw) 기준:
-    - (date, DATETIME, LINKID) 단위로 평균 속도 집계 → self_mean
-    - 관측 개수 n_obs 포함
-    """
     required = ["date", "DATETIME", "LINKID", "PASNGSPED"]
     for c in required:
         if c not in df.columns:
-            raise ValueError(f"bronze 데이터에 필수 컬럼 {c} 가 없습니다.")
-
+            raise ValueError(f"bronze 데이터에 필수 컬럼 {c}가 없습니다.")
+    
     agg = (
         df.groupBy("date", "DATETIME", "LINKID")
         .agg(
             F.avg("PASNGSPED").cast(T.FloatType()).alias("self_mean"),
-            F.count(F.lit(1)).alias("n_obs"),
+            F.count(F.lit(1)).alias("n_obs")
         )
     )
 
@@ -151,17 +108,12 @@ def transform_bronze_to_silver(df: DataFrame) -> DataFrame:
             F.col("DATETIME").alias("datetime"),
             F.col("LINKID").alias("linkid"),
             "self_mean",
-            "n_obs",
+            "n_obs"
         )
-        .orderBy("datetime", "linkid")
+        .ordeyBy("datetime", "linkid")
     )
-
     return out
 
-
-# ==============================
-# 링크 이웃 맵 (GeoPandas / Pandas)
-# ==============================
 def ensure_link_columns(gdf_links: gpd.GeoDataFrame) -> pd.DataFrame:
     cols_lower = {c.lower(): c for c in gdf_links.columns}
 
@@ -172,7 +124,7 @@ def ensure_link_columns(gdf_links: gpd.GeoDataFrame) -> pd.DataFrame:
             if c.lower() in cols_lower:
                 return cols_lower[c.lower()]
         raise KeyError(f"필수 컬럼 없음: {cands}")
-
+    
     link_col = pick(["LINK_ID", "LINKID", "LINK", "LINK_NO"])
     f_col = pick(["F_NODE", "FNODE", "F_NODEID", "F_NO"])
     t_col = pick(["T_NODE", "TNODE", "T_NODEID", "T_NO"])
@@ -184,7 +136,6 @@ def ensure_link_columns(gdf_links: gpd.GeoDataFrame) -> pd.DataFrame:
             sub[c] = sub[c].astype(str)
     return sub
 
-
 def build_neighbor_maps(
     link_tab: pd.DataFrame,
     target_linkids: List[str]
@@ -193,7 +144,7 @@ def build_neighbor_maps(
     idx_by_f = link_tab.groupby("F_NODE")["LINK_ID"].apply(set).to_dict()
     f_by_link = dict(zip(link_tab["LINK_ID"], link_tab["F_NODE"]))
     t_by_link = dict(zip(link_tab["LINK_ID"], link_tab["T_NODE"]))
-
+    
     out: Dict[str, Dict[str, Set[str]]] = {}
     target_linkids = [str(x) for x in target_linkids]
     for lid in target_linkids:
@@ -212,12 +163,12 @@ def build_neighbor_maps(
         next2_nodes = set(
             link_tab.loc[link_tab["LINK_ID"].isin(f1), "T_NODE"].unique().tolist()
         ) if f1 else set()
-
+        
         t2: Set[str] = set()
         if prev2_nodes:
             for n in prev2_nodes:
                 t2 |= set(idx_by_t.get(n, set()))
-
+        
         f2: Set[str] = set()
         if next2_nodes:
             for n in next2_nodes:
@@ -225,7 +176,6 @@ def build_neighbor_maps(
 
         out[lid] = {"t1": t1, "f1": f1, "t2": t2, "f2": f2}
     return out
-
 
 def neighbor_long_df(neighbor_maps: Dict[str, Dict[str, Set[str]]]) -> pd.DataFrame:
     rows = []
@@ -235,119 +185,3 @@ def neighbor_long_df(neighbor_maps: Dict[str, Dict[str, Set[str]]]) -> pd.DataFr
                 continue
             for nb in s:
                 rows.append((lid, hop, nb))
-    df = pd.DataFrame(rows, columns=["center_link", "hop", "neighbor_link"])
-    if not df.empty:
-        df["center_link"] = df["center_link"].astype("category")
-        df["hop"] = df["hop"].astype("category")
-        df["neighbor_link"] = df["neighbor_link"].astype("category")
-    return df
-
-
-# ==============================
-# SILVER → GOLD (Pandas 기반)
-# ==============================
-def compute_features_for_day(
-    spd_day: pd.DataFrame,
-    nb_long: pd.DataFrame,
-    target_linkids: List[str],
-) -> pd.DataFrame:
-    """
-    silver (datetime, linkid, self_mean) DataFrame + 이웃맵(롱포맷) → gold 피처
-    """
-    if spd_day.empty:
-        return pd.DataFrame(
-            columns=["date", "datetime", "linkid",
-                     "t2_mean", "t1_mean", "self_mean", "f1_mean", "f2_mean"]
-        )
-
-    spd_day = spd_day.copy()
-    spd_day["LINKID"] = spd_day["LINKID"].astype("category")
-
-    # 이웃 기준 speed 테이블
-    spd_nb = spd_day.rename(columns={"LINKID": "neighbor_link", "self_mean": "neighbor_speed"})
-    merged = nb_long.merge(spd_nb, on="neighbor_link", how="left")
-
-    hop_mean = (
-        merged.groupby(["DATETIME", "center_link", "hop"], observed=True)["neighbor_speed"]
-        .mean()
-        .astype("float32")
-        .reset_index()
-    )
-
-    hop_wide = hop_mean.pivot(
-        index=["DATETIME", "center_link"],
-        columns="hop",
-        values="neighbor_speed"
-    ).reset_index()
-    hop_wide = hop_wide.rename(columns={"center_link": "linkid"})
-
-    num_cols = [c for c in ["t2", "t1", "f1", "f2"] if c in hop_wide.columns]
-    for c in num_cols:
-        hop_wide[c] = hop_wide[c].astype("float32")
-    if num_cols:
-        hop_wide[num_cols] = hop_wide[num_cols].fillna(0.0)
-
-    # self_mean join
-    self_only = spd_day[["DATETIME", "LINKID", "self_mean"]].rename(
-        columns={"LINKID": "linkid"}
-    )
-    out = hop_wide.merge(self_only, on=["DATETIME", "linkid"], how="left")
-
-    out = out[out["linkid"].isin(target_linkids)].copy()
-
-    for col in ["t2", "t1", "f1", "f2"]:
-        if col not in out.columns:
-            out[col] = np.float32(0.0)
-
-    out = out.rename(
-        columns={
-            "t2": "t2_mean",
-            "t1": "t1_mean",
-            "f1": "f1_mean",
-            "f2": "f2_mean",
-        }
-    )
-    out["date"] = out["DATETIME"].dt.strftime("%Y%m%d")
-    out = out.rename(columns={"DATETIME": "datetime"})
-    out = out[
-        ["date", "datetime", "linkid", "t2_mean", "t1_mean", "self_mean", "f1_mean", "f2_mean"]
-    ].sort_values(["datetime", "linkid"]).reset_index(drop=True)
-
-    for c in ["t2_mean", "t1_mean", "f1_mean", "f2_mean", "self_mean"]:
-        out[c] = out[c].astype("float32")
-
-    return out
-
-
-def compute_gold_for_date_from_silver(
-    spark,
-    date_str: str,
-    silver_base: str = SILVER_BASE,
-    nb_long: pd.DataFrame | None = None,
-) -> DataFrame:
-    """
-    주어진 날짜(date=YYYYMMDD)에 대해:
-    - silver parquet 로드
-    - Pandas 변환
-    - 이웃 피처 계산
-    - 다시 Spark DataFrame 으로 반환
-    """
-    silver_path = f"{silver_base}/date={date_str}"
-    df_silver = spark.read.parquet(silver_path)
-
-    # 필요한 링크만 필터링 (ALL 기준)
-    df_silver = df_silver.filter(F.col("linkid").isin(LINKIDS_ALL))
-
-    # Pandas 로 변환
-    pdf = df_silver.select("date", "datetime", "linkid", "self_mean").toPandas()
-    pdf = pdf.rename(columns={"datetime": "DATETIME", "linkid": "LINKID"})
-
-    if nb_long is None:
-        # 이웃 맵이 없으면 그때그때 로드 (실제로는 바깥에서 1번 생성하고 넣어주는 게 좋음)
-        gdf_links = gpd.read_file(LINK_SHP_PATH)
-        link_tab = ensure_link_columns(gdf_links)
-        neighbor_maps = build_neighbor_maps(link_tab, LINKIDS_ALL)
-        nb_long = neighbor_long_df(neighbor_maps)
-
-    feat_day = compute_features_for_day(pdf, nb_long, TARGET_LINKS)
-    return spark.createDataFrame(feat_day)

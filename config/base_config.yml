@@ -3,7 +3,7 @@ kafka:
   bootstrap_servers: "broker:29092"
   topics:
     its_traffic_raw: "its_traffic_raw"
-
+  
 minio:
   endpoint: "localhost:9000"
   access_key: "minio"

@@ -1,19 +1,13 @@
 # src/pipelines/silver_to_gold.py
-
 import os
 import argparse
+import psycopg2
+from src.common.spark_session import create_spark
+from pyspark.sql import functions as F
 from datetime import datetime, timedelta
 
-from pyspark.sql import functions as F
-from src.common.spark_session import create_spark
-
-import psycopg2
-
-
 def _get_env(name: str, default: str) -> str:
-    """환경 변수 읽기 (없으면 default)."""
     return os.environ.get(name, default)
-
 
 def _delete_existing_partition(
     dt: str,
@@ -25,9 +19,6 @@ def _delete_existing_partition(
     password: str,
     date_col: str = "date",
 ) -> None:
-    """
-    재실행 시 중복 방지용: GOLD 테이블에서 해당 날짜 파티션을 미리 삭제.
-    """
     conn = None
     try:
         conn = psycopg2.connect(
@@ -35,34 +26,26 @@ def _delete_existing_partition(
             port=port,
             dbname=db,
             user=user,
-            password=password,
+            password=password
         )
         conn.autocommit = True
         with conn.cursor() as cur:
             sql = f'DELETE FROM "{table}" WHERE "{date_col}" = %s'
             cur.execute(sql, (dt,))
-        print(f'[SILVER→GOLD] {table} 에서 date={dt} 기존 행 삭제 완료')
+        print(f'[SILVER→GOLD] {table}에서 date={dt} 기존 행 삭제 완료')
     except Exception as e:
         print(f'[SILVER→GOLD][WARN] date={dt} 삭제 중 오류 (무시하고 진행): {e}')
     finally:
         if conn is not None:
             conn.close()
 
-
 def run_its_traffic_silver_to_gold(start_date: str, end_date: str) -> None:
-    """
-    ITS 5분 단위 교통 속도 Silver → Postgres GOLD 적재
-    """
-
-    # 🔹 Spark 세션 (S3 + JDBC 드라이버가 설정된 상태여야 함)
     spark = create_spark("SILVER_TO_GOLD_ITS_TRAFFIC_5MIN")
 
-    # 🔹 Silver 위치 (MinIO / S3A)
     base_silver = "s3a://its/traffic/silver"
 
-    # 🔹 Postgres 접속 정보 (환경변수 기반)
     pg_host = _get_env("PG_HOST", "localhost")
-    pg_port = _get_env("PG_PORT", "5431")
+    pg_port = _get_env("PG_PORT", "5432")
     pg_db = _get_env("PG_DB", "mlops")
     pg_user = _get_env("PG_USER", "postgres")
     pg_password = _get_env("PG_PASSWORD", "postgres")
@@ -82,15 +65,9 @@ def run_its_traffic_silver_to_gold(start_date: str, end_date: str) -> None:
 
         try:
             df_silver = spark.read.parquet(silver_path)
-
-            # ✅ 스키마 살짝 정리
-            # - datetime: timestamp 그대로 사용
-            # - linkid: string
-            # - speed_mean / count 같은 숫자 컬럼은 double/long 유지
+            
             cols = df_silver.columns
 
-            # 컬럼 이름 예시가 다를 수 있으니 guard 걸어서 처리
-            # (bronze_to_silver에서 어떤 이름 썼는지 맞춰서 필요시 살짝 수정하면 됨)
             rename_map = {}
             if "LINKID" in cols:
                 rename_map["LINKID"] = "linkid"
@@ -103,19 +80,15 @@ def run_its_traffic_silver_to_gold(start_date: str, end_date: str) -> None:
             for src, dst in rename_map.items():
                 df_out = df_out.withColumnRenamed(src, dst)
 
-            # date 컬럼은 GOLD 테이블 파티셔닝 / 조회용으로 하나 더 넣어줌
             df_out = df_out.withColumn("date", F.lit(dt).cast("string"))
 
-            # (선택) 컬럼 순서 정리
             ordered_cols = []
             for c in ["date", "datetime", "linkid"]:
                 if c in df_out.columns:
                     ordered_cols.append(c)
-            # 나머지 메트릭 컬럼들 뒤에 붙이기
             ordered_cols += [c for c in df_out.columns if c not in ordered_cols]
             df_out = df_out.select(*ordered_cols)
 
-            # ✅ 재실행 대비: 해당 날짜 데이터 먼저 삭제
             _delete_existing_partition(
                 dt=dt,
                 table=pg_table,
@@ -124,10 +97,9 @@ def run_its_traffic_silver_to_gold(start_date: str, end_date: str) -> None:
                 db=pg_db,
                 user=pg_user,
                 password=pg_password,
-                date_col="date",
+                date_col="date"
             )
 
-            # ✅ Postgres에 append
             (
                 df_out.write
                 .mode("append")
@@ -141,12 +113,11 @@ def run_its_traffic_silver_to_gold(start_date: str, end_date: str) -> None:
             )
 
             print(f"[SILVER→GOLD] {dt} → {pg_table} 적재 완료")
-
+        
         except Exception as e:
             print(f"[SILVER→GOLD][WARN] {dt} 처리 실패: {e}")
-
+        
         cur += timedelta(days=1)
-
 
 def main():
     parser = argparse.ArgumentParser()
@@ -159,7 +130,6 @@ def main():
         run_its_traffic_silver_to_gold(args.start_date, args.end_date)
     else:
         raise ValueError(f"지원하지 않는 job-name: {args.job_name}")
-
-
+    
 if __name__ == "__main__":
     main()
