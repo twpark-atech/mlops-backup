@@ -3,7 +3,7 @@ import os
 from pyspark.sql import SparkSession
 
 def create_spark(app_name: str) -> SparkSession:
-    s3_endpoint = os.getenv("S3_ENDPOINT", "http://localhost:9000")
+    s3_endpoint = os.getenv("S3_ENDPOINT", "http://minio:9000")
     s3_access_key = os.getenv("MINIO_ACCESS_KEY", "minio")
     s3_secret_key = os.getenv("MINIO_SECRET_KEY", "miniostorage")
 
