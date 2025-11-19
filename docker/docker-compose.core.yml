@@ -100,4 +100,4 @@ volumes:
 
 networks:
   mlops:
-    driver: bridge
+    external: true
